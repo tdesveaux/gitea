@@ -7,7 +7,9 @@ package lfs
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -15,6 +17,7 @@ import (
 
 	"code.gitea.io/gitea/modules/git"
 	"code.gitea.io/gitea/modules/git/pipeline"
+	"code.gitea.io/gitea/modules/log"
 )
 
 // SearchPointerBlobs scans the whole repository for LFS pointer files
@@ -51,6 +54,34 @@ func SearchPointerBlobs(ctx context.Context, repo *git.Repository, pointerChan c
 	} else {
 		go pipeline.CatFileBatchCheckAllObjects(ctx, catFileCheckWriter, &wg, basePath, errChan)
 	}
+	wg.Wait()
+
+	close(pointerChan)
+	close(errChan)
+}
+
+func SearchPointerBlobsInHeads(ctx context.Context, repo *git.Repository, headSHAs []string, pointerChan chan<- PointerBlob, errChan chan<- error) {
+	log.Info("[SearchPointerBlobsInHeads] repo Path: %s", repo.Path)
+	basePath := repo.Path
+
+	catFileBatchReader, catFileBatchWriter := io.Pipe()
+	shasToBatchReader, shasToBatchWriter := io.Pipe()
+
+	wg := sync.WaitGroup{}
+	wg.Add(3)
+
+	// Create the go-routines in reverse order.
+
+	// 1. Take the output of cat-file --batch and check if each file in turn
+	// to see if they're pointers to files in the LFS store
+	go createPointerResultsFromCatFileBatch(ctx, catFileBatchReader, &wg, pointerChan)
+
+	// 2. Take the shas of the blobs and batch read them
+	go pipeline.CatFileBatch(ctx, shasToBatchReader, catFileBatchWriter, &wg, basePath)
+
+	// 1. List all blobs of size <1024 which belong to the given commit
+	go revListBlobsForHeads(ctx, shasToBatchWriter, &wg, basePath, headSHAs, errChan)
+
 	wg.Wait()
 
 	close(pointerChan)
@@ -107,5 +138,25 @@ loop:
 		}
 
 		pointerChan <- PointerBlob{Hash: sha, Pointer: pointer}
+	}
+}
+
+func revListBlobsForHeads(ctx context.Context, revListWriter *io.PipeWriter, wg *sync.WaitGroup, tmpBasePath string, headSHAs []string, errChan chan<- error) {
+	defer wg.Done()
+	defer revListWriter.Close()
+	stderr := new(bytes.Buffer)
+	cmd := git.NewCommand(
+		ctx, "rev-list",
+		"--objects", "--no-object-names",
+		// filter only blobs, with a size less than 1024
+		"--filter-provided-objects", "--filter=blob:limit=1024", "--filter=object:type=blob",
+	).AddDynamicArguments(headSHAs...).AddArguments("--not", "--all")
+	if err := cmd.Run(&git.RunOpts{
+		Dir:    tmpBasePath,
+		Stdout: revListWriter,
+		Stderr: stderr,
+	}); err != nil {
+		log.Error("git rev-list [%s]: %v - %s", tmpBasePath, err, stderr.String())
+		errChan <- fmt.Errorf("git rev-list [%s]: %w - %s", tmpBasePath, err, stderr.String())
 	}
 }

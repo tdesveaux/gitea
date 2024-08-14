@@ -17,8 +17,10 @@ import (
 	"code.gitea.io/gitea/models/unit"
 	user_model "code.gitea.io/gitea/models/user"
 	"code.gitea.io/gitea/modules/git"
+	"code.gitea.io/gitea/modules/lfs"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/private"
+	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/web"
 	gitea_context "code.gitea.io/gitea/services/context"
 	pull_service "code.gitea.io/gitea/services/pull"
@@ -132,7 +134,92 @@ func HookPreReceive(ctx *gitea_context.PrivateContext) {
 		}
 	}
 
+	if setting.LFS.StartServer {
+		preReceiveLFS(ourCtx)
+		if ctx.Written() {
+			return
+		}
+	}
+
 	ctx.PlainText(http.StatusOK, "ok")
+}
+
+func preReceiveLFS(ctx *preReceiveContext) {
+	if !ctx.AssertCanWriteCode() {
+		return
+	}
+
+	objectFormat := ctx.Repo.GetObjectFormat()
+	emptyObjectID := objectFormat.EmptyObjectID().String()
+
+	var newCommits []string
+	for _, newCommitID := range ctx.opts.NewCommitIDs {
+		// Branch deletion, nothing to check
+		if newCommitID == emptyObjectID {
+			continue
+		}
+		newCommits = append(newCommits, newCommitID)
+	}
+
+	repo := ctx.Repo
+
+	pointerChan := make(chan lfs.PointerBlob)
+	errChan := make(chan error, 1)
+
+	go lfs.SearchPointerBlobsInHeads(ctx, repo.GitRepo, newCommits, pointerChan, errChan)
+
+	contentStore := lfs.NewContentStore()
+
+	for pointerBlob := range pointerChan {
+		if _, err := git_model.GetLFSMetaObjectByOid(ctx, repo.Repository.ID, pointerBlob.Oid); err != nil {
+			if err != git_model.ErrLFSObjectNotExist {
+				// TODO(tdesveaux) fail?
+				log.Error("Error when checking pointer exists in LFS MetaObject DB %-v. %-v in %-v Error: %v", pointerBlob.Oid, newCommits, repo, err)
+				ctx.JSON(http.StatusInternalServerError, private.Response{
+					Err:     err.Error(),
+					UserMsg: fmt.Sprintf("Error when checking pointer exists in LFS MetaObject DB %-v. %-v in %-v Error: %v", pointerBlob.Oid, newCommits, repo, err),
+				})
+				return
+			} else {
+				// TODO(tdesveaux) fail, LFS not found
+				log.Error("Error pointer OID does not exist in LFS MetaObject DB %-v. %-v in %-v Error: %v", pointerBlob.Oid, newCommits, repo, err)
+				ctx.JSON(http.StatusInternalServerError, private.Response{
+					Err:     err.Error(),
+					UserMsg: fmt.Sprintf("Error pointer OID does not exist in LFS MetaObject DB %-v. %-v in %-v Error: %v", pointerBlob.Oid, newCommits, repo, err),
+				})
+				return
+			}
+		}
+
+		pointerExists, err := contentStore.Exists(pointerBlob.Pointer)
+		if err != nil {
+			log.Error("Error checking LFS ContentStore for Pointer %-v. %-v in %-v Error: %v", pointerBlob.Pointer, newCommits, repo, err)
+			ctx.JSON(http.StatusInternalServerError, private.Response{
+				Err:     err.Error(),
+				UserMsg: fmt.Sprintf("Error checking LFS ContentStore for Pointer %-v. %-v in %-v Error: %v", pointerBlob.Pointer, newCommits, repo, err),
+			})
+			return
+		}
+		if !pointerExists {
+			// TODO(tdesveaux) fail, LFS not found
+			log.Error("Error Pointer does not exist in LFS ContentStore. %-v in %-v Error: %v", newCommits, repo, err)
+			ctx.JSON(http.StatusInternalServerError, private.Response{
+				UserMsg: fmt.Sprintf("Error Pointer does not exist in LFS ContentStore. %-v in %-v Error: %v", newCommits, repo, err),
+			})
+			return
+		}
+	}
+
+	err, has := <-errChan
+	if has {
+		// TODO(tdesveaux) fail?
+		log.Error("Error in SearchPointerBlobsInHeads errChan. %-v in %-v Error: %v", newCommits, repo, err)
+		ctx.JSON(http.StatusInternalServerError, private.Response{
+			Err:     err.Error(),
+			UserMsg: fmt.Sprintf("Error in SearchPointerBlobsInHeads errChan. %-v in %-v Error: %v", newCommits, repo, err),
+		})
+		return
+	}
 }
 
 func preReceiveBranch(ctx *preReceiveContext, oldCommitID, newCommitID string, refFullName git.RefName) {
