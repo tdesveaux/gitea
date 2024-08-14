@@ -242,7 +242,7 @@ Gitea or set your environment appropriately.`, "")
 		// If the ref is a branch or tag, check if it's protected
 		// if supportProcReceive all ref should be checked because
 		// permission check was delayed
-		if supportProcReceive || refFullName.IsBranch() || refFullName.IsTag() {
+		if supportProcReceive || refFullName.IsBranch() || refFullName.IsTag() || setting.LFS.StartServer {
 			oldCommitIDs[count] = oldCommitID
 			newCommitIDs[count] = newCommitID
 			refFullNames[count] = refFullName
